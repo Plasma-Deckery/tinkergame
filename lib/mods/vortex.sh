@@ -421,7 +421,15 @@ function getVortexSupported {
 		SDIR="$1"
 		if [ -d "$SDIR" ]; then
 			writelog "INFO" "${FUNCNAME[0]} - Searching for SteamIDs in '$SDIR'"
-			mapfile -t -O "${#VOSTIDS[@]}" VOSTIDS <<< "$(grep -iR "STEAMAPP_ID =\|STEAM_ID =\|steamAppId:" "$SDIR" | grep -v "module.exports" | grep -oP "'\K[^']+" | grep "[0-9]" | sort -u)"
+			# Vortex 2.x ships its extensions in
+			# resources/app.asar.unpacked/bundledPlugins, where the Steam IDs
+			# are written unquoted (steamAppId: 629730), kept in a constant
+			# (const STEAM_ID = "489830") or wrapped in either quote style.
+			# The old single-quote-only extraction found no IDs at all there
+			# and leaked arbitrary single-quoted strings out of the bundled JS
+			# into VOSTIDS instead. Match the key/value forms and keep only
+			# the digits.
+			mapfile -t -O "${#VOSTIDS[@]}" VOSTIDS <<< "$(grep -iRhE "STEAMAPP_ID *=|STEAM_ID *=|APPID *=|steamAppId:|steamId:" "$SDIR" | grep -v "module.exports" | grep -ioE "(steamapp_id|steam_id|appid|steamappid|steamid)[[:space:]]*[:=][[:space:]]*['\"]?[0-9]+" | grep -oE "[0-9]+" | sort -u)"
 		fi
 	}
 
@@ -451,12 +459,21 @@ function getVortexSupportedNames {
 
 	VGPDIR="$VORTEXINSTDIR/$RABP"
 	for VOSTGAMDIR in "$VGPDIR/game-"*/; do
-		if [ -f "$VOSTGAMDIR/$VOSTINDEXJS" ] && [ -f "$VOSTGAMDIR/$VOSTINFOJSON" ]; then
+		# Vortex 2.x ships some bundled extensions as index.cjs
+		if [ -f "$VOSTGAMDIR/$VOSTINDEXJS" ]; then
+			VOSTINDEXFILE="$VOSTGAMDIR/$VOSTINDEXJS"
+		elif [ -f "$VOSTGAMDIR/index.cjs" ]; then
+			VOSTINDEXFILE="$VOSTGAMDIR/index.cjs"
+		else
+			VOSTINDEXFILE=""
+		fi
+
+		if [ -n "$VOSTINDEXFILE" ] && [ -f "$VOSTGAMDIR/$VOSTINFOJSON" ]; then
 			# Get Vortex game name from the Vortex supported gamedir's `info.json` file
 			VOSTGAMDIRNAM="$( "$JQ" '.name' "$VOSTGAMDIR/$VOSTINFOJSON" | sed 's-^"--g;s-^Game:--g;s-"$--g;s-^Stub:--g;s-^Game--g;s-^\ --g' )"
 
-			# Match Steam AppIDs from `index.js` file - grep order is order if preference to search on
-			VOSTGAMDIRAID="$( sed "s-'--g;s-\"--g" "$VOSTGAMDIR/$VOSTINDEXJS" | grep -ioE "steamAppId: [0-9]+|STEAMAPP_ID = [0-9]+|STEAM_ID = [0-9]+|APPID = [0-9]+|steamId: [0-9]+" | grep -oE "[0-9]+" | head -n1 )"
+			# Match Steam AppIDs from the extension entry point - grep order is order if preference to search on
+			VOSTGAMDIRAID="$( sed "s-'--g;s-\"--g" "$VOSTINDEXFILE" | grep -ioE "steamAppId[[:space:]]*:[[:space:]]*[0-9]+|STEAMAPP_ID[[:space:]]*=[[:space:]]*[0-9]+|STEAM_ID[[:space:]]*=[[:space:]]*[0-9]+|APPID[[:space:]]*=[[:space:]]*[0-9]+|steamId[[:space:]]*:[[:space:]]*[0-9]+" | grep -oE "[0-9]+" | head -n1 )"
 
 			# If we still can't find it, search based on domain name (usually this is directory name without game- pfx) from Vortex games list, may be incomplete so we don't search on it by default
 			if [ -z "$VOSTGAMDIRAID" ]; then
@@ -476,7 +493,7 @@ function getVortexSupportedNames {
 
 			printf '%s (%s)\n' "$VOSTGAMDIRNAM" "$VOSTGAMDIRAID"
 		else
-			writelog "SKIP" "${FUNCNAME[0]} - Could not find '$VOSTINDEXJS' or '$VOSTINFOJSON' for Vortex game in '$VOSTGAMDIR' - Skipping"
+			writelog "SKIP" "${FUNCNAME[0]} - Could not find '$VOSTINDEXJS'/'index.cjs' or '$VOSTINFOJSON' for Vortex game in '$VOSTGAMDIR' - Skipping"
 		fi
 	done
 }
@@ -495,10 +512,10 @@ function checkVortexRegs {
 
 	if grep -q "Wow6432Node" <<< "$1"; then
 		REGKEY="$1"
-		REG32KEY="${REGKEY//\\Wow6432Node\\/}"
+		REG32KEY="${REGKEY/\\Wow6432Node\\/\\}"
 	elif grep -q "WOW6432Node" <<< "$1"; then
 		REGKEY="${1//WOW6432Node/Wow6432Node}"
-		REG32KEY="${REGKEY//\\Wow6432Node\\/}"
+		REG32KEY="${REGKEY/\\Wow6432Node\\/\\}"
 	else
 		REG32KEY="$1"
 		REGKEY="${REG32KEY//Software\\\\/Software\\\\Wow6432Node\\\\}"
@@ -620,6 +637,24 @@ function setGameVortexStaging {
 				HOMEMP="$(df -P "${STLVORTEXDIR%/*}" | awk 'END{print $NF}')"
 				writelog "INFO" "${FUNCNAME[0]} - HOMEMP is $HOMEMP and GAMEMP is $GAMEMP"
 
+				# Prefer a staging dir inside the game's SteamLibrary dir, next
+				# to steamapps: under Wine Vortex compares the virtual volume id
+				# of the game with the one of the staging dir and disables
+				# hardlink deployment ("Works only if mods are installed on the
+				# same drive as the game") when they differ - even when both
+				# dirs are on the same filesystem.  That happens when a staging
+				# dir in ~/.config resolves through a different Wine drive than
+				# the game, e.g. on btrfs where every subvolume has its own
+				# st_dev, or when Proton mapped the Steam library to 's:' but
+				# that mapping does not cover the config dir.  Keeping the
+				# staging dir besides the game makes both resolve identically.
+				# Note: this only applies when no staging dir is configured for
+				# the partition yet (see $VORTEXSTAGELIST above); manually
+				# configured dirs are never overridden.
+				if grep -q "/steamapps/" <<< "$VGAMEDIR"; then
+					getVortexStage "$(awk -F 'steamapps' '{print $1}' <<< "$VGAMEDIR")${VTX^}"
+				fi
+
 				# don't pollute base steam installation with a ~/.steam/steam/Vortex dir, so default to $STLVORTEXDIR/stageing
 				if [ "$GAMEMP" == "$HOMEMP" ]; then
 					getVortexStage "$STLVORTEXDIR/staging"
@@ -627,9 +662,6 @@ function setGameVortexStaging {
 
 				# try in base directory of the partition:
 				getVortexStage "$GAMEMP/${VTX^}"
-
-				# then try in the current SteamLibrary dir besides steamapps, as it should be writeable by the user and is unused from steam(?):
-				getVortexStage "$(awk -F 'steamapps' '{print $1}' <<< "$VGAMEDIR")${VTX^}"
 
 				# updating Vortex config with the new found VORTEXSTAGING dir:
 				touch "$VORTEXSTAGELIST"
@@ -674,12 +706,12 @@ function activateVortexGame {
 	NEXUSGAMEID="$(grep "\"$1\"" "$VORTEXGAMES" | cut -d ';' -f1)"
 	NEXUSGAMEID="${NEXUSGAMEID//\"}"
 	if [ -n "$NEXUSGAMEID" ]; then
-			NEXRAND="$(tr -dc 'a-zA-Z0-9' < /dev/urandom | fold -w 9 | head -n1)" # valid?
 			writelog "INFO" "${FUNCNAME[0]} - Activating game '$NEXUSGAMEID' ($1) in ${VTX^}" "E"
 			setVortSet "settings.mods.activator.$NEXUSGAMEID=\"\\\"hardlink_activator\\\"\""
-			setVortSet "settings.profiles.activeProfileId=\"\\\"$NEXRAND\\\"\""
-			setVortSet "settings.profiles.lastActiveProfile.$NEXUSGAMEID=\"\\\"$NEXRAND\\\"\""
-			setVortSet "settings.profiles.nextProfileId=\"\\\"$NEXRAND\\\"\""
+			# No settings.profiles.* fiddling here: overwriting the profile ids
+			# with random values that don't correspond to any profile made
+			# Vortex fail to activate a profile on the next start.  Profiles are
+			# created and switched by Vortex itself (--game ...).
 			runVortSetCmd
 	else
 		writelog "ERROR" "${FUNCNAME[0]} - No valid  NEXUSGAMEID found for '$1'" "E"
@@ -694,7 +726,10 @@ function setupGameVortex {
 		WINEDEBUG="-all" WINEPREFIX="$VORTEXPFX" "$VORTEXWINE" "$VORTEXEXE" "--get" "settings" > "$VORTGETSET" 2>/dev/null
 	fi
 
-	if [ -f "$VORTGETSET" ] && grep -q "$NEXUSGAMEID=\"hardlink_activator\"" "$VORTGETSET"; then
+	# Vortex 2.x prints "key = value" with spaces around the '=', 1.x printed
+	# "key=value". Accept both, otherwise the game is believed to be missing
+	# and re-applied on every launch.
+	if [ -f "$VORTGETSET" ] && grep -qE "${NEXUSGAMEID}[[:space:]]*=[[:space:]]*\"hardlink_activator\"" "$VORTGETSET"; then
 		writelog "SKIP" "${FUNCNAME[0]} - '$NEXUSGAMEID' is already added to Vortex"
 	else
 		writelog "INFO" "${FUNCNAME[0]} - Activating game dir '$VZGAMEDIR' for '$NEXUSGAMEID ($VAID)' in Vortex"
@@ -704,6 +739,48 @@ function setupGameVortex {
 		setVortSet "settings.gameMode.discovered.$NEXUSGAMEID.path=\"\\\"$VZGAMEDIR\\\"\""
 		setVortSet "settings.gameMode.discovered.$NEXUSGAMEID.pathSetManually=true"
 	fi
+}
+
+# Parse the arguments of a winapi.RegGetValue(hive, key, name) snippet into
+# 'KEY;NAME'. Handles the single and double quoted Vortex 2.x extension
+# styles, collapses JavaScript doubled backslashes and adds the WOW6432Node
+# registry view unless the extension names it itself. Prints nothing and
+# returns 1 when the snippet has no literal registry path (for example when
+# the extension passes variables instead).
+function parseVortexRegPath {
+	local RAW="$1"
+	RAW="$(sed -E 's/,[[:space:]]+/,/g' <<< "$RAW")"
+
+	local HIVE PKEY PNAME
+	HIVE="$(awk -F ',' '{print $1}' <<< "$RAW")"
+	PKEY="$(awk -F ',' '{print $2}' <<< "$RAW")"
+	PNAME="$(awk -F ',' '{print $3}' <<< "$RAW")"
+
+	# strip surrounding quotes and whitespace
+	HIVE="$(sed -E "s/^[[:space:]]*['\"]//; s/['\"][[:space:]]*$//" <<< "$HIVE")"
+	PKEY="$(sed -E "s/^[[:space:]]*['\"]//; s/['\"][[:space:]]*$//" <<< "$PKEY")"
+	PNAME="$(sed -E "s/^[[:space:]]*['\"]//; s/['\"][[:space:]]*$//" <<< "$PNAME")"
+
+	# variable arguments instead of a literal path - nothing we can import
+	if [[ ! "$HIVE" =~ ^HKEY_ ]] || [[ "$PKEY" != *"\\"* ]] || [ -z "$PNAME" ]; then
+		return 1
+	fi
+
+	# JS template literals with interpolations cannot be resolved statically
+	if [[ "$PKEY" == *'`'* ]]; then
+		return 1
+	fi
+
+	# '\\' in the JS source is a single path separator for the .reg file
+	PKEY="${PKEY//\\\\/\\}"
+
+	# The registry path the extensions probe is the 32-bit view, which lives
+	# under WOW6432Node - only add it when the extension does not use it yet
+	if ! grep -qi "WOW6432Node" <<< "$PKEY"; then
+		PKEY="${PKEY/[Ss][Oo][Ff][Tt][Ww][Aa][Rr][Ee]/Software\\Wow6432Node}"
+	fi
+
+	printf '%s\\%s;%s\n' "$HIVE" "$PKEY" "$PNAME"
 }
 
 function setInstPathReg {
@@ -726,29 +803,17 @@ function setInstPathReg {
 
 				if grep -q "HKEY" <<< "$RAWREG"; then
 					writelog "INFO" "${FUNCNAME[0]} - Found a HKEY entry: $RAWREG - working on it"
-					SNIP="','S" # :)
-					REGWIP1="${RAWREG//HINE$SNIP/HINE\\S}"
-					REGWIP="${REGWIP1//T_USER','S/T_USER\\\\S}"
+					PARSEDREG="$(parseVortexRegPath "$RAWREG")" || PARSEDREG=""
 
-					writelog "INFO" "${FUNCNAME[0]} - REGWIP is $REGWIP"
-
-					REGWIPKEY="$(awk -F ',' '{print $1}' <<< "$REGWIP" | sed "s:'::g")"
-					PATHKEY="$(awk -F ',' '{print $2}' <<< "$REGWIP" | sed "s:'::g")"
-
-					if grep -q -i "WOW6432Node" <<< "$REGWIPKEY"; then
-						writelog "INFO" "${FUNCNAME[0]} - Squeezing in a 'WOW6432Node' into the '$REGWIPKEY' string"
-						REGKEY="${REGWIPKEY/[Ss][Oo][Ff][Tt][Ww][Aa][Rr][Ee]/Software\\\\\\WOW6432Node}"
+					if [ -n "$PARSEDREG" ]; then
+						REGKEY="${PARSEDREG%%;*}"
+						PATHKEY="${PARSEDREG#*;}"
+						writelog "INFO" "${FUNCNAME[0]} - Final REGKEY is '$REGKEY' with value name '$PATHKEY'"
 					else
-						REGKEY="$REGWIPKEY"
+						writelog "SKIP" "${FUNCNAME[0]} - '$RAWREG' does not contain a literal registry path - skipping registry insert"
 					fi
-
-					writelog "INFO" "${FUNCNAME[0]} - Final REGKEY is '$REGKEY'"
 				else
-					if grep -q "hive" <<< "$RAWREG"; then
-						writelog "INFO" "${FUNCNAME[0]} - Found a hive, key, name placeholder - required?"
-					else
-						writelog "SKIP" "${FUNCNAME[0]} - No valid registry found in cut entry '$RAWREG' - skipping"
-					fi
+					writelog "SKIP" "${FUNCNAME[0]} - No valid registry found in cut entry '$RAWREG' - skipping"
 				fi
 			else
 				writelog "SKIP" "${FUNCNAME[0]} - Haven't found any useable registry entries in '$NEXUSGAMEFILE' - skipping registry insert"
@@ -1449,20 +1514,33 @@ function installVortex {
 				writelog "INFO" "${FUNCNAME[0]} - Using '$VORTEXPROTON' for installation" "E"
 				mkProjDir "$VORTEXCOMPDATA"
 
-				## TODO dotnet installation currently fails on Steam Deck because it needs to be installed with the SLR
-				## There is no clean way to run Winetricks from the SLR if it's in `/usr/bin/winetricks` or similar, so
-				## for now we leave it up to Vortex to install dotnet6.
-				##
-				## This could be fixed with some hacky symlinking of dotnet perhaps, even temporarily while we install
-				## some winetricks components, and then removed afterwards, but this would be a separate feature.
-				## Removing this line should helph get Vortex working on SteamOS for now, until they break it again.
-				##
-				## For context, see https://github.com/sonic2kk/steamtinkerlaunch/issues/806#issuecomment-1565759961
-
-				# Vortex 1.8.0+ only requires DotNet6 (only need to pass desktop6, as installDotNet will append dotnet)
-				# writelog "INFO" "${FUNCNAME[0]} - Installing .NET 6 for Vortex Mod Manager"
-				# notiShow "$(strFix "$NOTY_INSTSTART" "${DOTN^}")" "S"
-				# installDotNet "$VORTEXPFX" "$VORTEXWINE" "desktop6"  # Should be easy to bump if a newer version is ever required
+				# Vortex 2.x uses a .NET 9 based FOMOD installer. Vortex
+				# installs that runtime itself from a Fix prompt, but the
+				# prompt runs the Windows .NET installer from the renderer
+				# and is not reliable under Wine. Preinstall it with
+				# Winetricks whenever we are not going through the Steam
+				# Linux Runtime.
+				#
+				# Winetricks cannot be driven cleanly from the SLR, so with
+				# VORTEXUSESLR=1 we keep leaving the runtime to Vortex.
+				# See https://github.com/sonic2kk/steamtinkerlaunch/issues/806
+				if [ -n "${SLRCMD[*]}" ]; then
+					writelog "INFO" "${FUNCNAME[0]} - Vortex is installing through the SLR - leaving .NET Desktop Runtime 9 to Vortex"
+				elif ls -d "$VORTEXPFX/$DRC/Program Files/dotnet/shared/Microsoft.WindowsDesktop.App/9."* >/dev/null 2>&1; then
+					writelog "INFO" "${FUNCNAME[0]} - .NET Desktop Runtime 9 already installed in '$VORTEXPFX'"
+				else
+					chooseWinetricks
+					if [ -n "$WINETRICKS" ]; then
+						writelog "INFO" "${FUNCNAME[0]} - Installing .NET Desktop Runtime 9 for Vortex Mod Manager"
+						notiShow "$(strFix "$NOTY_INSTSTART" ".NET Desktop Runtime 9")" "S"
+						installDotNet "$VORTEXPFX" "$VORTEXWINE" "desktop9"
+						if ! ls -d "$VORTEXPFX/$DRC/Program Files/dotnet/shared/Microsoft.WindowsDesktop.App/9."* >/dev/null 2>&1; then
+							writelog "WARN" "${FUNCNAME[0]} - .NET Desktop Runtime 9 installation did not complete - Vortex will offer to install it on first start"
+						fi
+					else
+						writelog "SKIP" "${FUNCNAME[0]} - No Winetricks available - leaving .NET Desktop Runtime 9 to Vortex"
+					fi
+				fi
 
 				touch "${VORTEXCOMPDATA}/tracked_files"
 				STEAM_COMPAT_CLIENT_INSTALL_PATH="$SROOT" STEAM_COMPAT_DATA_PATH="$VORTEXCOMPDATA" "$VORTEXPROTON" "run" 2> "$STLSHM/${FUNCNAME[0]}_protonrun.log"

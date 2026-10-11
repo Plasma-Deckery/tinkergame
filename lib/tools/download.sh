@@ -5,8 +5,8 @@
 #  cross-module references are invisible to per-file analysis)
 # TinkerGame library module -- sourced by the "tinkergame" entry point. Do not execute directly.
 
-# progress label for a custom proton download - derive the proton name from its
-# download url so the StatusWindow shows which version is being downloaded
+# status label for a custom proton download - derive the proton name from its
+# download url so the log shows which version is being downloaded
 function dlCustProtonStatusText {
 	local CPURL="${1//\"/}"
 	if [ -z "$CPURL" ]; then
@@ -121,6 +121,57 @@ function dlCustomProton {
 	fi
 }
 
+# Map 'uname -m' to the architecture suffix custom Proton archives use.
+# Prints nothing on architectures TinkerGame has no builds for, which
+# disables architecture filtering and selection (keep everything).
+function getHostProtonArch {
+	case "$(uname -m)" in
+		x86_64|amd64) echo "x86_64" ;;
+		aarch64|arm64) echo "aarch64" ;;
+	esac
+}
+
+# Drop download URLs for foreign-architecture builds from stdin. Builds
+# without an architecture in the file name (TKG, STL) are kept, and unknown
+# host architectures disable filtering.
+function filterProtonArch {
+	local OTHERARCH
+	case "$(getHostProtonArch)" in
+		x86_64)  OTHERARCH="aarch64|arm64" ;;
+		aarch64) OTHERARCH="x86_64|amd64" ;;
+		*)       cat; return ;;
+	esac
+	# Never fail: an empty result must not break the caller's pipeline
+	grep -Ev -- "-(${OTHERARCH})\." || true
+}
+
+# Echo the first line from stdin matching the host architecture. Falls back
+# to the first line when nothing matches (unlabelled builds, unknown host
+# architecture), so a stale cached list cannot resolve to a foreign build.
+function pickHostProton {
+	local ARCHPAT
+	case "$(getHostProtonArch)" in
+		x86_64)  ARCHPAT="x86_64|amd64" ;;
+		aarch64) ARCHPAT="aarch64|arm64" ;;
+		*)       head -n1; return ;;
+	esac
+
+	# Buffer stdin: grep inside the command substitution would drain it
+	local LINES=()
+	mapfile -t LINES
+	if [ "${#LINES[@]}" -eq 0 ]; then
+		return
+	fi
+
+	local MATCH
+	MATCH="$(printf "%s\n" "${LINES[@]}" | grep -m1 -E -- "-(${ARCHPAT})\." || true)"
+	if [ -n "$MATCH" ]; then
+		printf "%s\n" "$MATCH"
+	else
+		printf "%s\n" "${LINES[0]}"
+	fi
+}
+
 function createDLProtList {
 	if [ ! -x "$(command -v "$JQ")" ]; then
 		writelog "WARN" "${FUNCNAME[0]} - 'jq' is not installed - Can't generate list of online Proton versions"
@@ -139,7 +190,11 @@ function createDLProtList {
 					SRCURL="${SRCURL//$GHURL/$AGHURL\/repos}"
 					SRCURL="${SRCURL}/releases"
 
-					"$WGET" -q "$SRCURL" -O - | "$JQ" -r '.[].assets[].browser_download_url' | grep "tar.gz\|tar.xz" | grep -v "Yad\|7.x" >> "$PROTDLLIST"
+					# '7\.x' with an escaped dot: the filter is a regex, so an
+					# unescaped dot also matches the '-' in asset names like
+					# GE-Proton11-7-x86_64.tar.gz and drops every x86_64 build
+					# filterProtonArch then drops builds for foreign architectures
+					"$WGET" -q "$SRCURL" -O - | "$JQ" -r '.[].assets[].browser_download_url' | grep "tar.gz\|tar.xz" | grep -v "Yad\|7\.x" | filterProtonArch >> "$PROTDLLIST"
 				fi
 			done <<< "$(grep "^CP_" "$STLURLCFG" | cut -d '=' -f1)"
 		fi
@@ -171,7 +226,7 @@ function dlCustomProtonGUI {
 	pollWinRes "$TITLE"
 
 	if [ -z "$DLPROTON" ]; then
-		DLPROTON="${ProtonDLDispList[0]}"
+		DLPROTON="$(printf "%s\n" "${ProtonDLDispList[@]}" | pickHostProton)"
 	fi
 
 	if [ -z "$DLPROTLIST" ]; then
@@ -440,13 +495,16 @@ function addCustomProtonToList {
 function dlLatestGE {
 	createDLProtList
 
-	if [ -n "${ProtonDLList[0]}" ]; then
+	local LATESTPROTON
+	LATESTPROTON="$(printf "%s\n" "${ProtonDLList[@]}" | pickHostProton)"
+
+	if [ -n "$LATESTPROTON" ]; then
 		if [ "$1" == "latestge" ] || [ "$1" == "lge" ]; then
 			writelog "INFO" "${FUNCNAME[0]} - Downloading latest Proton GE"
 		else
-			writelog "INFO" "${FUNCNAME[0]} - Downloading latest custom Proton ${ProtonDLDispList[0]//\"/}"
+			writelog "INFO" "${FUNCNAME[0]} - Downloading latest custom Proton ${LATESTPROTON##*/}"
 		fi
-		StatusWindow "$(dlCustProtonStatusText "${ProtonDLList[0]//\"/}")" "dlCustomProton ${ProtonDLList[0]//\"/} $2" "DownloadCustomProtonStatus"
+		StatusWindow "$(dlCustProtonStatusText "${LATESTPROTON//\"/}")" "dlCustomProton ${LATESTPROTON//\"/} $2" "DownloadCustomProtonStatus"
 	else
 		writelog "ERROR" "${FUNCNAME[0]} - Could not create list of downloadable Proton-Versions"
 	fi
